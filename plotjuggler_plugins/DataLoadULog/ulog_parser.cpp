@@ -127,144 +127,133 @@ ULogParser::ULogParser(DataStream& datastream) : _file_start_time(0)
 
 void ULogParser::parseDataMessage(const ULogParser::Subscription& sub, char* message)
 {
-  size_t other_fields_count = 0;
-  std::string ts_name = sub.message_name;
+    size_t index = 0;
+    std::string ts_name = sub.message_name;
 
-  for (const auto& field : sub.format->fields)
-  {
-    if (field.type == OTHER)
-    {
-      other_fields_count++;
-    }
-  }
-
-  if (_message_name_with_multi_id.count(ts_name) > 0)
-  {
-    char buff[16];
-    sprintf(buff, ".%02d", sub.multi_id);
-    ts_name += std::string(buff);
-  }
-
-  // get the timeseries or create if if it doesn't exist
-  auto ts_it = _timeseries.find(ts_name);
-  if (ts_it == _timeseries.end())
-  {
-    ts_it = _timeseries.insert({ ts_name, createTimeseries(sub.format) }).first;
-  }
-  Timeseries& timeseries = ts_it->second;
-
-  size_t index = 0;
-  parseSimpleDataMessage(timeseries, sub.format, message, &index);
-}
-
-char* ULogParser::parseSimpleDataMessage(Timeseries& timeseries, const Format* format,
-                                         char* message, size_t* index)
-{
-  for (const auto& field : format->fields)
-  {
-    // skip _padding messages which are one byte in size
-    if (StringView(field.field_name).starts_with("_padding"))
-    {
-      message += field.array_size;
-      continue;
+    if (_message_name_with_multi_id.count(ts_name) > 0) {
+        char buff[16];
+        sprintf(buff, ".%02d", sub.multi_id);
+        ts_name += std::string(buff);
     }
 
-    bool timestamp_done = false;
-    for (int array_pos = 0; array_pos < field.array_size; array_pos++)
-    {
-      if (format->timestamp_idx < 0)
-      {
-        // No timestamps defined in this message
+    // temporary storage for one record
+    std::optional<uint64_t> timestamp;
+    std::unordered_map<size_t, double> values;
+    std::string name_field;
+    std::optional<int> id_field;
+
+    // parse into buffer
+    message = parseSimpleDataMessage(
+        sub.format, message, &index,
+        timestamp, values, name_field, id_field
+    );
+
+    // determine target key
+    std::string key = ts_name;
+    if (!name_field.empty()) {
+        key += "/" + name_field;
+    } else if (id_field) {
+        key += "/" + std::to_string(*id_field);
+    }
+
+    // lookup/create timeseries
+    auto ts_it = _timeseries.find(key);
+    if (ts_it == _timeseries.end()) {
+        ts_it = _timeseries.insert({ key, createTimeseries(sub.format) }).first;
+    }
+    Timeseries& timeseries = ts_it->second;
+
+    // commit buffered data
+    if (timestamp) {
+        timeseries.timestamps.push_back(*timestamp);
+    } else {
         timeseries.timestamps.push_back(std::nullopt);
-      }
-      else if (*index == format->timestamp_idx && !timestamp_done)
-      {
-        timestamp_done = true;
-        uint64_t time_val = *reinterpret_cast<uint64_t*>(message);
-        timeseries.timestamps.push_back(time_val);
-        message += sizeof(uint64_t);
-      }
-      double value = 0;
-      switch (field.type)
-      {
-        case UINT8: {
-          value = static_cast<double>(*reinterpret_cast<uint8_t*>(message));
-          message += 1;
-        }
-        break;
-        case INT8: {
-          value = static_cast<double>(*reinterpret_cast<int8_t*>(message));
-          message += 1;
-        }
-        break;
-        case UINT16: {
-          value = static_cast<double>(*reinterpret_cast<uint16_t*>(message));
-          message += 2;
-        }
-        break;
-        case INT16: {
-          value = static_cast<double>(*reinterpret_cast<int16_t*>(message));
-          message += 2;
-        }
-        break;
-        case UINT32: {
-          value = static_cast<double>(*reinterpret_cast<uint32_t*>(message));
-          message += 4;
-        }
-        break;
-        case INT32: {
-          value = static_cast<double>(*reinterpret_cast<int32_t*>(message));
-          message += 4;
-        }
-        break;
-        case UINT64: {
-          value = static_cast<double>(*reinterpret_cast<uint64_t*>(message));
-          message += 8;
-        }
-        break;
-        case INT64: {
-          value = static_cast<double>(*reinterpret_cast<int64_t*>(message));
-          message += 8;
-        }
-        break;
-        case FLOAT: {
-          value = static_cast<double>(*reinterpret_cast<float*>(message));
-          message += 4;
-        }
-        break;
-        case DOUBLE: {
-          value = (*reinterpret_cast<double*>(message));
-          message += 8;
-        }
-        break;
-        case CHAR: {
-          value = static_cast<double>(*reinterpret_cast<char*>(message));
-          message += 1;
-        }
-        break;
-        case BOOL: {
-          value = static_cast<double>(*reinterpret_cast<bool*>(message));
-          message += 1;
-        }
-        break;
-        case OTHER: {
-          // recursion!!!
-          auto child_format = _formats.at(field.other_type_ID);
-          message += sizeof(uint64_t);  // skip timestamp
-          message = parseSimpleDataMessage(timeseries, &child_format, message, index);
-        }
-        break;
+    }
 
-      }  // end switch
-
-      if (field.type != OTHER)
-      {
-        timeseries.data[(*index)++].second.push_back(value);
-      }
-    }  // end for
-  }
-  return message;
+    for (auto& [field_idx, value] : values) {
+        timeseries.data[field_idx].second.push_back(value);
+    }
 }
+
+
+char* ULogParser::parseSimpleDataMessage(
+    const Format* format,
+    char* message,
+    size_t* index,
+    std::optional<uint64_t>& timestamp,
+    std::unordered_map<size_t, double>& values,
+    std::string& name_field,
+    std::optional<int>& id_field)
+{
+    for (const auto& field : format->fields) {
+        if (StringView(field.field_name).starts_with("_padding")) {
+            message += field.array_size;
+            continue;
+        }
+
+        bool timestamp_done = false;
+        for (int array_pos = 0; array_pos < field.array_size; array_pos++) {
+            if (format->timestamp_idx >= 0 &&
+                *index == format->timestamp_idx && !timestamp_done) {
+                timestamp_done = true;
+                timestamp = *reinterpret_cast<uint64_t*>(message);
+                message += sizeof(uint64_t);
+            }
+
+            double value = 0;
+            switch (field.type) {
+                case UINT8:  value = *reinterpret_cast<uint8_t*>(message);  message += 1; break;
+                case INT8:   value = *reinterpret_cast<int8_t*>(message);   message += 1; break;
+                case UINT16: value = *reinterpret_cast<uint16_t*>(message); message += 2; break;
+                case INT16:  value = *reinterpret_cast<int16_t*>(message);  message += 2; break;
+                case UINT32: value = *reinterpret_cast<uint32_t*>(message); message += 4; break;
+                case INT32:  value = *reinterpret_cast<int32_t*>(message);  message += 4; break;
+                case UINT64: value = *reinterpret_cast<uint64_t*>(message); message += 8; break;
+                case INT64:  value = *reinterpret_cast<int64_t*>(message);  message += 8; break;
+                case FLOAT:  value = *reinterpret_cast<float*>(message);    message += 4; break;
+                case DOUBLE: value = *reinterpret_cast<double*>(message);   message += 8; break;
+                case CHAR:   value = *reinterpret_cast<char*>(message);     message += 1; break;
+                case BOOL:   value = *reinterpret_cast<bool*>(message);     message += 1; break;
+                case OTHER: {
+                    auto child_format = _formats.at(field.other_type_ID);
+                    message += sizeof(uint64_t); // skip child timestamp
+                    message = parseSimpleDataMessage(
+                        &child_format, message, index,
+                        timestamp, values, name_field, id_field);
+                    continue;
+                }
+            }
+
+            // special-case handling
+            if (field.field_name == "name" && field.type == CHAR) {
+                // collect characters across array
+                name_field.push_back(static_cast<char>(value));
+            } else if (field.field_name == "id" &&
+                       (field.type == UINT8)) {
+                id_field = static_cast<uint8_t>(value);
+            } else if (field.type != OTHER) {
+                values[*index] = value;
+            }
+
+            if (field.type != OTHER) {
+                (*index)++;
+            }
+        }
+    }
+
+    // finalize name field (trim at \0)
+    if (!name_field.empty()) {
+        size_t end = name_field.find('\0');
+        if (end != std::string::npos) {
+            name_field.resize(end);
+        }
+    }
+
+    return message;
+}
+
+
+
 
 const std::map<std::string, ULogParser::Timeseries>& ULogParser::getTimeseriesMap() const
 {

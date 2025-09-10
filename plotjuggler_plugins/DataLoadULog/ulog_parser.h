@@ -108,11 +108,11 @@ public:
     const Format* format;
   };
 
-  struct Timeseries
+  typedef struct _Timeseries
   {
     std::vector<std::optional<uint64_t>> timestamps;
     std::vector<std::pair<std::string, std::vector<double>>> data;
-  };
+  } Timeseries;
 
 public:
   ULogParser(DataStream& datastream);
@@ -172,6 +172,14 @@ private:
 
   void parseDataMessage(const Subscription& sub, char* message);
 
-  char* parseSimpleDataMessage(Timeseries& timeseries, const Format* format, char* message,
-                               size_t* index);
+  //char* parseSimpleDataMessage(Timeseries& timeseries, const Format* format, char* message,size_t* index);
+  //Timeseries& 
+  char* parseSimpleDataMessage(
+    const Format* format,
+    char* message,
+    size_t* index,
+    std::optional<uint64_t>& timestamp,
+    std::unordered_map<size_t, double>& values,
+    std::string& name_field,
+    std::optional<int>& id_field);
 };
